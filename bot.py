@@ -8,16 +8,16 @@ from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
 from colorama import init, Fore, Style
-import json
 import warnings
+import asyncio
 from pymongo import MongoClient
 
 warnings.filterwarnings('ignore')
 
-# Inicjalizacja colorama
+# Initialize colorama
 init()
 
-# Konfiguracja logowania z rotacją
+# Configure logging with rotation
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,13 +27,14 @@ logging.basicConfig(
     ]
 )
 
-# Konfiguracja MongoDB
+# MongoDB configuration
 MONGO_URI = os.getenv('MONGO_URI', 'your_mongodb_connection_string')
 client = MongoClient(MONGO_URI)
 db = client['trading_bot']
 positions_collection = db['positions']
+closed_positions_collection = db['closed_positions']
 
-# Konfiguracja API KuCoin
+# KuCoin API configuration
 exchanges = [
     ccxt.kucoin({
         'apiKey': '6823adfb61d4190001722ff5',
@@ -58,7 +59,7 @@ exchanges = [
 for i, exchange in enumerate(exchanges):
     exchange.exchange_id = f'KuCoin{i+1}'
 
-# Parametry handlu
+# Trading parameters
 timeframe = '1h'
 initial_capital = 70
 max_positions = 10
@@ -69,7 +70,7 @@ scan_interval = 180
 sl_tp_interval = 3
 price_update_interval = 10
 
-# Strategie
+# Trading strategies
 strategies = [
     {
         'name': 'Strategia 45',
@@ -81,7 +82,7 @@ strategies = [
             'sl_percent': 3.0, 'tp_percent': 4.0
         }
     },
-    # Dodaj pozostałe strategie
+    # Add other strategies here if needed
 ]
 
 async def place_limit_order(symbol, side, amount, price, exchange_index=0, retries=3, delay=5):
@@ -158,8 +159,127 @@ def load_positions():
         logging.error(f"Błąd przy wczytywaniu pozycji z MongoDB: {e}")
         return {}
 
-# Funkcje get_top_pairs, fetch_ohlcv, calculate_indicators, check_signals, itp. pozostają bez zmian
-# Zakładam, że są zdefiniowane w Twoim kodzie. Jeśli nie, proszę podaj je, a dodam.
+def save_closed_positions(closed_position):
+    try:
+        closed_positions_collection.insert_one(closed_position)
+        logging.info(f"Zapisano zamkniętą pozycję dla {closed_position['symbol']}")
+    except Exception as e:
+        logging.error(f"Błąd przy zapisywaniu zamkniętej pozycji: {e}")
+
+def get_top_pairs(exchange_index=0):
+    exchange = exchanges[exchange_index % len(exchanges)]
+    try:
+        tickers = exchange.fetch_tickers()
+        sorted_tickers = sorted(
+            [(symbol, ticker['quoteVolume']) for symbol, ticker in tickers.items() if symbol.endswith('/USDT')],
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return [symbol for symbol, _ in sorted_tickers[:70]]
+    except Exception as e:
+        logging.error(f"Błąd przy pobieraniu top par ({exchange.exchange_id}): {e}")
+        return []
+
+async def fetch_ohlcv(symbol, timeframe, since, exchange_index=0):
+    exchange = exchanges[exchange_index % len(exchanges)]
+    try:
+        await asyncio.sleep(0.5)  # Delay to avoid rate limits
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        logging.info(f"Użyto {exchange.exchange_id} dla fetch_ohlcv {symbol}")
+        return df
+    except Exception as e:
+        logging.error(f"Błąd przy pobieraniu danych dla {symbol} ({exchange.exchange_id}): {e}")
+        return None
+
+def calculate_indicators(df, params):
+    try:
+        df['rsi'] = ta.rsi(df['close'], length=params['rsi_period'])
+        macd = ta.macd(df['close'], fast=params['macd_fast'], slow=params['macd_slow'], signal=params['macd_signal'])
+        df['macd'] = macd['MACD_12_26_9']
+        df['macd_signal'] = macd['MACDs_12_26_9']
+        bb = ta.bbands(df['close'], length=params['bb_period'], std=params['bb_std'])
+        df['bb_upper'] = bb['BBU_10_1.0']
+        df['bb_lower'] = bb['BBL_10_1.0']
+        return df
+    except Exception as e:
+        logging.error(f"Błąd przy obliczaniu wskaźników: {e}")
+        return None
+
+def check_signals(df, strategy):
+    try:
+        latest = df.iloc[-1]
+        rsi = latest['rsi']
+        macd = latest['macd']
+        macd_signal = latest['macd_signal']
+        close = latest['close']
+        bb_lower = latest['bb_lower']
+        bb_upper = latest['bb_upper']
+        
+        rsi_buy = rsi < strategy['params']['rsi_low']
+        macd_buy = macd > macd_signal
+        bb_buy = close < bb_lower
+        
+        return rsi_buy and macd_buy and bb_buy
+    except Exception as e:
+        logging.error(f"Błąd przy sprawdzaniu sygnałów: {e}")
+        return False
+
+def place_order(symbol, side, amount, price, exchange_index=0):
+    exchange = exchanges[exchange_index % len(exchanges)]
+    try:
+        if side == 'buy':
+            order = exchange.create_market_buy_order(symbol, amount)
+        else:
+            order = exchange.create_market_sell_order(symbol, amount)
+        logging.info(f"Złożono zlecenie {side} dla {symbol}: ilość={amount}, cena={price} ({exchange.exchange_id})")
+        return order
+    except Exception as e:
+        logging.error(f"Błąd przy składaniu zlecenia {side} dla {symbol} ({exchange.exchange_id}): {e}")
+        return None
+
+def sync_with_wallet(positions):
+    # Placeholder: Implement wallet synchronization logic
+    logging.info("Synchronizacja z portfelem (placeholder)")
+    return positions
+
+def get_balance(exchange_index=0):
+    exchange = exchanges[exchange_index % len(exchanges)]
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free'] if 'USDT' in balance else 0
+        logging.info(f"Pobrano balans: {usdt_balance} USDT ({exchange.exchange_id})")
+        return usdt_balance
+    except Exception as e:
+        logging.error(f"Błąd przy pobieraniu balansu ({exchange.exchange_id}): {e}")
+        return initial_capital
+
+async def update_position_prices(positions, exchange_index=0):
+    exchange = exchanges[exchange_index % len(exchanges)]
+    try:
+        for key in positions:
+            symbol = key.split('_', 1)[0] if '_' in key else key
+            ticker = exchange.fetch_ticker(symbol)
+            positions[key]['current_price'] = ticker['last']
+        save_positions(positions)
+        logging.info(f"Zaktualizowano ceny pozycji ({exchange.exchange_id})")
+    except Exception as e:
+        logging.error(f"Błąd przy aktualizacji cen pozycji ({exchange.exchange_id}): {e}")
+
+def display_interface(positions, buy_offers, available_capital, symbols):
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"{Fore.BLUE}=== Bot Handlowy KuCoin ==={Style.RESET_ALL}")
+    print(f"Kapitał dostępny: {available_capital:.2f} USDT")
+    print(f"Liczba otwartych pozycji: {len(positions)}/{max_positions}")
+    print(f"Pary do skanowania: {len(symbols)}")
+    print(f"Oferty kupna: {len(buy_offers)}")
+    print("\nPozycje otwarte:")
+    for key, pos in positions.items():
+        print(f"{key}: {pos['amount']:.6f} @ {pos['entry_price']:.2f}, Aktualna cena: {pos['current_price']:.2f}, TP: {pos['tp_price']:.2f}, SL: {pos['sl_price']:.2f}")
+    print("\nOferty kupna:")
+    for offer in buy_offers:
+        print(f"{offer['symbol']} ({offer['strategy']})")
 
 async def main():
     positions = load_positions()
@@ -248,7 +368,7 @@ async def main():
                         if position_key in positions:
                             continue
                         try:
-                            df = fetch_ohlcv(symbol, timeframe, since, exchange_counter)
+                            df = await fetch_ohlcv(symbol, timeframe, since, exchange_counter)
                             exchange_counter += 1
                             if df is None or df.empty:
                                 continue
