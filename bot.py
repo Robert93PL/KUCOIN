@@ -10,11 +10,6 @@ from logging.handlers import RotatingFileHandler
 from colorama import init, Fore, Style
 import json
 import warnings
-import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import aiohttp
-import async_timeout
 from pymongo import MongoClient
 
 warnings.filterwarnings('ignore')
@@ -31,11 +26,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# Konfiguracja Telegram
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7414561599:AAHMWV1x-AoJ-wsx_3Rn84kyqpoAKaSF-Kw')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1892848136')
-telegram_app = None
 
 # Konfiguracja MongoDB
 MONGO_URI = os.getenv('MONGO_URI', 'your_mongodb_connection_string')
@@ -70,9 +60,9 @@ for i, exchange in enumerate(exchanges):
 
 # Parametry handlu
 timeframe = '1h'
-initial_capital = 60
-max_positions = 12
-capital_per_position = 5
+initial_capital = 70
+max_positions = 10
+capital_per_position = 6
 fee_rate = 0.001
 data_days = 7
 scan_interval = 180
@@ -93,19 +83,6 @@ strategies = [
     },
     # Dodaj pozostałe strategie
 ]
-
-async def send_telegram_message(message):
-    global telegram_app
-    if telegram_app is None:
-        logging.error("Aplikacja Telegram nie zainicjalizowana")
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with async_timeout.timeout(10):
-                await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        logging.info(f"Wysłano wiadomość Telegram: {message}")
-    except Exception as e:
-        logging.error(f"Błąd przy wysyłaniu wiadomości Telegram: {e}")
 
 async def place_limit_order(symbol, side, amount, price, exchange_index=0, retries=3, delay=5):
     exchange = exchanges[exchange_index % len(exchanges)]
@@ -181,15 +158,10 @@ def load_positions():
         logging.error(f"Błąd przy wczytywaniu pozycji z MongoDB: {e}")
         return {}
 
-# Pozostałe funkcje (get_top_pairs, fetch_ohlcv, calculate_indicators, itp.) bez zmian
-# ...
+# Funkcje get_top_pairs, fetch_ohlcv, calculate_indicators, check_signals, itp. pozostają bez zmian
+# Zakładam, że są zdefiniowane w Twoim kodzie. Jeśli nie, proszę podaj je, a dodam.
 
 async def main():
-    global telegram_app
-    await start_telegram_bot()
-    if telegram_app is None:
-        logging.error("Nie udało się uruchomić bota Telegram, kontynuuję bez obsługi komend")
-
     positions = load_positions()
     positions = sync_with_wallet(positions)
     since = int((datetime.now() - timedelta(days=data_days)).timestamp() * 1000)
@@ -259,12 +231,6 @@ async def main():
                                     'reason': reason
                                 }
                                 logging.info(f"Zamknięto pozycję ({reason}) dla {key}: zysk/strata={profit:.2f} USDT")
-                                message = (f"Zamknięto pozycję ({reason})\n"
-                                           f"Symbol: {symbol}\n"
-                                           f"Strategia: {strategy_name}\n"
-                                           f"Zysk/Strata: {profit:.2f} USDT\n"
-                                           f"Czas: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                                await send_telegram_message(message)
                                 save_closed_positions(closed_position)
                                 other_order_id = pos['sl_order_id'] if reason == 'TP' else pos['tp_order_id']
                                 await cancel_order(symbol, other_order_id, i)
@@ -311,12 +277,6 @@ async def main():
                                             'sl_price': sl_price
                                         }
                                         logging.info(f"Otwarto pozycję dla {position_key}: ilość={amount}, cena={current_price}")
-                                        message = (f"Otwarto pozycję\n"
-                                                   f"Symbol: {symbol}\n"
-                                                   f"Strategia: {strategy['name']}\n"
-                                                   f"Ilość: {amount:.6f}\n"
-                                                   f"Cena: {current_price:.2f} USDT")
-                                        await send_telegram_message(message)
                                         save_positions(positions)
                                         break
                                 except Exception as e:
@@ -328,7 +288,6 @@ async def main():
             await asyncio.sleep(sl_tp_interval)
         except Exception as e:
             logging.error(f"Krytyczny błąd w pętli głównej: {e}")
-            await send_telegram_message(f"Krytyczny błąd bota: {e}. Restartuję...")
             await asyncio.sleep(60)
 
 if __name__ == "__main__":
