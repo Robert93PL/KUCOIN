@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import aiohttp
 import async_timeout
+from pymongo import MongoClient
 
 warnings.filterwarnings('ignore')
 
@@ -26,15 +27,21 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        RotatingFileHandler('trade_log.txt', maxBytes=10*1024*1024, backupCount=5),  # Rotacja co 10MB
+        RotatingFileHandler('trade_log.txt', maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
 
 # Konfiguracja Telegram
-TELEGRAM_BOT_TOKEN = '7414561599:AAHMWV1x-AoJ-wsx_3Rn84kyqpoAKaSF-Kw'
-TELEGRAM_CHAT_ID = '1892848136'
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7414561599:AAHMWV1x-AoJ-wsx_3Rn84kyqpoAKaSF-Kw')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1892848136')
 telegram_app = None
+
+# Konfiguracja MongoDB
+MONGO_URI = os.getenv('MONGO_URI', 'your_mongodb_connection_string')
+client = MongoClient(MONGO_URI)
+db = client['trading_bot']
+positions_collection = db['positions']
 
 # Konfiguracja API KuCoin
 exchanges = [
@@ -84,7 +91,7 @@ strategies = [
             'sl_percent': 3.0, 'tp_percent': 4.0
         }
     },
-    # Pozostałe strategie bez zmian
+    # Dodaj pozostałe strategie
 ]
 
 async def send_telegram_message(message):
@@ -100,18 +107,28 @@ async def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Błąd przy wysyłaniu wiadomości Telegram: {e}")
 
-# Funkcja do wystawiania zleceń limitowych
-async def place_limit_order(symbol, side, amount, price, exchange_index=0):
+async def place_limit_order(symbol, side, amount, price, exchange_index=0, retries=3, delay=5):
     exchange = exchanges[exchange_index % len(exchanges)]
-    try:
-        order = exchange.create_limit_order(symbol, side, amount, price)
-        logging.info(f"Zlecenie limitowe {side} dla {symbol}: ilość={amount}, cena={price}, order_id={order['id']} ({exchange.exchange_id})")
-        return order
-    except Exception as e:
-        logging.error(f"Błąd przy składaniu zlecenia limitowego {side} dla {symbol} ({exchange.exchange_id}): {e}")
-        return None
+    for attempt in range(retries):
+        try:
+            markets = exchange.load_markets()
+            market = markets[symbol]
+            price_precision = market['precision']['price']
+            price = round(price, price_precision)
+            amount = round(amount, market['precision']['amount'])
+            order = exchange.create_limit_order(symbol, side, amount, price)
+            logging.info(f"Zlecenie limitowe {side} dla {symbol}: ilość={amount}, cena={price}, order_id={order['id']} ({exchange.exchange_id})")
+            return order
+        except ccxt.RateLimitExceeded as e:
+            logging.warning(f"Limit API osiągnięty dla {symbol} ({exchange.exchange_id}). Próba {attempt + 1}/{retries}. Czekam {delay} sekund.")
+            await asyncio.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            logging.error(f"Błąd przy składaniu zlecenia limitowego {side} dla {symbol} ({exchange.exchange_id}): {e}")
+            return None
+    logging.error(f"Nie udało się złożyć zlecenia po {retries} próbach dla {symbol} ({exchange.exchange_id})")
+    return None
 
-# Funkcja do anulowania zlecenia
 async def cancel_order(symbol, order_id, exchange_index=0):
     exchange = exchanges[exchange_index % len(exchanges)]
     try:
@@ -120,25 +137,53 @@ async def cancel_order(symbol, order_id, exchange_index=0):
     except Exception as e:
         logging.error(f"Błąd przy anulowaniu zlecenia {order_id} dla {symbol} ({exchange.exchange_id}): {e}")
 
-# Ulepszona funkcja zapisu pozycji
 def save_positions(positions):
     try:
-        with open('positions.json', 'w') as f:
-            positions_to_save = {}
-            for key, pos in positions.items():
-                pos_copy = pos.copy()
-                pos_copy['buy_time'] = pos_copy['buy_time'].isoformat()
-                pos_copy['strategy'] = pos_copy['strategy']['name']
-                pos_copy['symbol'] = key.split('_', 1)[0] if '_' in key else key
-                pos_copy['tp_order_id'] = pos.get('tp_order_id')
-                pos_copy['sl_order_id'] = pos.get('sl_order_id')
-                positions_to_save[key] = pos_copy
-            json.dump(positions_to_save, f, indent=4)
-        logging.info("Zapisano stan pozycji do positions.json")
+        positions_to_save = []
+        for key, pos in positions.items():
+            pos_copy = pos.copy()
+            pos_copy['buy_time'] = pos_copy['buy_time'].isoformat()
+            pos_copy['strategy'] = pos_copy['strategy']['name']
+            pos_copy['symbol'] = key.split('_', 1)[0] if '_' in key else key
+            pos_copy['tp_order_id'] = pos.get('tp_order_id')
+            pos_copy['sl_order_id'] = pos.get('sl_order_id')
+            pos_copy['_id'] = key
+            positions_to_save.append(pos_copy)
+        if positions_to_save:
+            positions_collection.delete_many({})
+            positions_collection.insert_many(positions_to_save)
+        else:
+            positions_collection.delete_many({})
+        logging.info("Zapisano stan pozycji do MongoDB")
     except Exception as e:
-        logging.error(f"Błąd przy zapisywaniu pozycji: {e}")
+        logging.error(f"Błąd przy zapisywaniu pozycji do MongoDB: {e}")
 
-# Ulepszona pętla główna
+def load_positions():
+    try:
+        positions = {}
+        for pos in positions_collection.find():
+            strategy = next((s for s in strategies if s['name'] == pos['strategy']), strategies[0])
+            key = pos['_id']
+            positions[key] = {
+                'amount': pos['amount'],
+                'entry_price': pos['entry_price'],
+                'strategy': strategy,
+                'buy_time': datetime.fromisoformat(pos['buy_time']),
+                'current_price': pos.get('current_price', pos['entry_price']),
+                'tp_price': pos.get('tp_price', pos['entry_price'] * (1 + strategy['params']['tp_percent'] / 100)),
+                'sl_price': pos.get('sl_price', pos['entry_price'] * (1 - strategy['params']['sl_percent'] / 100)),
+                'tp_order_id': pos.get('tp_order_id'),
+                'sl_order_id': pos.get('sl_order_id')
+            }
+        logging.info(f"Wczytano {len(positions)} pozycji z MongoDB")
+        return positions
+    except Exception as e:
+        logging.error(f"Błąd przy wczytywaniu pozycji z MongoDB: {e}")
+        return {}
+
+# Pozostałe funkcje (get_top_pairs, fetch_ohlcv, calculate_indicators, itp.) bez zmian
+# ...
+
 async def main():
     global telegram_app
     await start_telegram_bot()
@@ -179,7 +224,6 @@ async def main():
             exchange_counter += 1
             buy_offers = []
 
-            # Sprawdzanie SL/TP (teraz zlecenia limitowe)
             for i, key in enumerate(list(positions.keys())):
                 try:
                     symbol = key.split('_', 1)[0] if '_' in key else key
@@ -190,7 +234,6 @@ async def main():
                     tp_price = pos['tp_price']
                     amount = pos['amount']
 
-                    # Wystawianie zleceń limitowych TP/SL przy otwarciu pozycji
                     if 'tp_order_id' not in pos or 'sl_order_id' not in pos:
                         tp_order = await place_limit_order(symbol, 'sell', amount, tp_price, i)
                         sl_order = await place_limit_order(symbol, 'sell', amount, sl_price, i)
@@ -202,7 +245,6 @@ async def main():
                             logging.error(f"Nie udało się wystawić zleceń TP/SL dla {key}")
                             continue
 
-                    # Sprawdzanie statusu zleceń
                     exchange = exchanges[i % len(exchanges)]
                     for order_id, reason in [(pos['tp_order_id'], 'TP'), (pos['sl_order_id'], 'SL')]:
                         try:
@@ -224,7 +266,6 @@ async def main():
                                            f"Czas: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                                 await send_telegram_message(message)
                                 save_closed_positions(closed_position)
-                                # Anulowanie drugiego zlecenia
                                 other_order_id = pos['sl_order_id'] if reason == 'TP' else pos['tp_order_id']
                                 await cancel_order(symbol, other_order_id, i)
                                 del positions[key]
@@ -234,7 +275,6 @@ async def main():
                 except Exception as e:
                     logging.error(f"Błąd przy sprawdzaniu SL/TP dla {key} ({exchanges[i % len(exchanges)].exchange_id}): {e}")
 
-            # Skanowanie sygnałów kupna
             if (current_time % scan_interval) < sl_tp_interval:
                 for symbol in symbols:
                     for strategy in strategies:
@@ -289,10 +329,9 @@ async def main():
         except Exception as e:
             logging.error(f"Krytyczny błąd w pętli głównej: {e}")
             await send_telegram_message(f"Krytyczny błąd bota: {e}. Restartuję...")
-            await asyncio.sleep(60)  # Czekaj przed ponowną próbą
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    save_script()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
